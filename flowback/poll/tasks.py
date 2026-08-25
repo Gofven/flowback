@@ -21,9 +21,11 @@ from django.utils import timezone
 from backend.settings import DEBUG, FLOWBACK_KPI_MAX_WEIGHT
 from flowback.common.services import get_object
 from flowback.group.models import (
+    Group,
     GroupTags,
     GroupUser,
     GroupUserDelegatePool,
+    GroupKPI,
     GroupKPIValue,
 )
 from flowback.group.selectors.permission import permission_q
@@ -44,12 +46,21 @@ from flowback.poll.phases import (
     PollProposal,
     PollProposalKPI,
     PollProposalKPIBet,
+    PollProposalKPIVote,
     PollVoting,
 )
 
+from flowback.poll.services.prediction import longest_poll_prediction_kpi_group_users
+from flowback.poll.tasks_new_kpi import (
+    newer_kpi_betting,
+    update_kpi_combined_bets_from_bets,
+)
 import numpy as np
 
 from flowback.poll.notify import notify_poll
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @shared_task
@@ -109,174 +120,17 @@ def poll_kpi_count(poll_id: int, disable_dprint: bool = True):
     poll.status_prediction = 2
     poll.save()
 
-    # Subquery to get the winning kpis per proposal
-    pollproposalkpi_sq = (
-        PollProposalKPI.objects.filter(
-            proposal=OuterRef("proposal"), kpi_value__kpi=OuterRef("kpi_value__kpi")
+    weighted_averages = []
+    for kpi in GroupKPI.objects.filter(group=poll.created_by.group, active=True):
+        weights = newer_kpi_betting(group=poll.created_by.group, kpi=kpi)
+
+        # Bets close together with this poll's own prediction_bet phase, so they're the
+        # only data available yet: this is what populates combined_bet for delegates.
+        kpi_bets = PollProposalKPIBet.objects.filter(
+            proposal_kpi__proposal__poll=poll,
+            proposal_kpi__kpi_value__kpi=kpi,
         )
-        .annotate(sum_score=Count("pollproposalkpivote"))
-        .exclude(Q(sum_score__isnull=True) | Q(sum_score__lte=0))
-        .order_by("-sum_score")
-        .values("id")[:1]
-    )
-
-    # List of eligible KPIs
-    proposal_kpis = PollProposalKPI.objects.filter(
-        Q(Q(proposal__poll__end_date__lte=timestamp) & ~Q(proposal__poll=poll))
-        | Q(proposal__poll=poll),
-        proposal__poll__created_by__group=poll.created_by.group,
-        proposal__poll__poll_type=Poll.PollType.V2_SCORE,
-        kpi_value__kpi__active=True,
-    )
-
-    winning_proposal_kpis = proposal_kpis.annotate(winner=pollproposalkpi_sq).filter(
-        winner=F("id")
-    )
-
-    if settings.FLOWBACK_ENABLE_NEW_KPI_SYSTEM:
-        return [
-            newer_kpi_betting(
-                winning_proposal_kpi=winning_proposal_kpi,
-            )
-            for winning_proposal_kpi in winning_proposal_kpis
-        ]
-
-    dprint(
-        "Winning KPIs",
-        [
-            f"KPI value {i.kpi_value.value} for KPI {i.kpi_value.kpi.name} "
-            f"for proposal {i.proposal_id}"
-            for i in winning_proposal_kpis
-        ],
-        disable_dprint=disable_dprint,
-    )
-
-    # Get current proposals and KPIs
-    group_kpis = GroupKPIValue.objects.filter(kpi__active=True).all()
-
-    for kpi_val in group_kpis:
-        dprint(
-            f"Evaluating KPI value {kpi_val.value} for KPI {kpi_val.kpi.name}",
-            disable_dprint=disable_dprint,
-        )
-        current_kpis = proposal_kpis.filter(kpi_value=kpi_val, proposal__poll=poll)
-        previous_winning_kpis = winning_proposal_kpis.filter(kpi_value=kpi_val).exclude(
-            proposal__poll=poll
-        )
-        previous_outcomes = [1] * previous_winning_kpis.count()
-
-        # Get users that are relevant for the kpi value
-        group_users_current_filter = list(
-            PollProposalKPIBet.objects.filter(
-                proposal_kpi_id__in=current_kpis, weight__gt=0
-            )
-            .distinct("created_by")
-            .values_list("created_by", flat=True)
-        )
-
-        # Get relevant users by previous history
-        group_users_previous_filter = list(
-            PollProposalKPIBet.objects.filter(
-                proposal_kpi_id__in=previous_winning_kpis, weight__gt=0
-            )
-            .distinct("created_by")
-            .values_list("created_by", flat=True)
-        )
-
-        group_users = GroupUser.objects.filter(
-            id__in=group_users_current_filter
-        ).filter(id__in=group_users_previous_filter)
-
-        # Helper for annotation
-        def user_weight_annotation_dict(group_user: GroupUser) -> dict:
-            max_weight_sq = (
-                PollProposalKPIBet.objects.filter(
-                    created_by=group_user,
-                    proposal_kpi__kpi_value__kpi=OuterRef("kpi_value__kpi"),
-                    proposal_kpi__proposal=OuterRef("proposal"),
-                    weight__gt=0,
-                )
-                .values("created_by")
-                .annotate(
-                    sum_weight=Sum("weight"),
-                    max_weight=Greatest("sum_weight", FLOWBACK_KPI_MAX_WEIGHT),
-                )
-                .values("max_weight")[:1]
-            )
-
-            weight_sq = PollProposalKPIBet.objects.filter(
-                created_by=group_user, proposal_kpi_id=OuterRef("id"), weight__gt=0
-            ).values("weight")
-
-            # Manage previous bets
-            output_field = models.DecimalField(decimal_places=4, max_digits=12)
-            return dict(
-                weight=Subquery(weight_sq),
-                max_weight=Subquery(max_weight_sq),
-                user_weight=Cast(F("weight"), output_field=output_field)
-                / Cast(F("max_weight"), output_field=output_field),
-            )
-
-        previous_bets = []
-        current_bets = []
-        for group_user in group_users:
-            previous_user_bets = previous_winning_kpis.annotate(
-                **user_weight_annotation_dict(group_user)
-            )
-            dprint(
-                [
-                    f"[{i + 1}] User {group_user} has weight "
-                    f"{round(x.user_weight, 2) if x.user_weight is not None else None}, "
-                    f"using max weight {x.max_weight} for KPI {kpi_val.value}"
-                    for i, x in enumerate(previous_user_bets)
-                ],
-                disable_dprint=disable_dprint,
-            )
-
-            previous_bets.append(
-                previous_user_bets.values_list("user_weight", flat=True)
-            )
-            current_bets.append(
-                current_kpis.annotate(
-                    **user_weight_annotation_dict(group_user)
-                ).values_list("user_weight", flat=True)
-            )
-
-        dprint(
-            "KPI order: ",
-            ", ".join(
-                [
-                    f"Proposal {i.proposal_id}, "
-                    f"KPI {kpi_val.kpi.name}, "
-                    f"Value {kpi_val.value}"
-                    for i in current_kpis
-                ]
-            ),
-            disable_dprint=disable_dprint,
-        )
-
-        if current_bets and not all(
-            [all([j is None for j in i]) for i in current_bets]
-        ):
-            dprint("Current bets: ", current_bets, disable_dprint=disable_dprint)
-            dprint("Previous bets: ", previous_bets, disable_dprint=disable_dprint)
-            dprint(
-                "Previous outcomes: ", previous_outcomes, disable_dprint=disable_dprint
-            )
-            dprint("Calculating for: ", kpi_val.kpi.name, disable_dprint=disable_dprint)
-            calculate_combined_bet(
-                current_kpis_or_statements=current_kpis,
-                current_bets=[
-                    [float(i) if i is not None else None for i in x]
-                    for x in current_bets
-                ],
-                previous_bets=[
-                    [float(i) if i is not None else None for i in x]
-                    for x in previous_bets
-                ],
-                previous_outcomes=previous_outcomes,
-                disable_dprint=disable_dprint,
-            )
+        update_kpi_combined_bets_from_bets(kpi_bets, weights or {})
 
     poll.status_prediction = 1
     poll.save()
@@ -286,6 +140,8 @@ def poll_kpi_count(poll_id: int, disable_dprint: bool = True):
         action=NotificationChannel.Action.UPDATED,
         poll=poll,
     )
+
+    return weighted_averages
 
 
 @shared_task
@@ -795,96 +651,3 @@ def poll_proposal_vote_count(poll_id: int) -> None:
         )
 
         poll.poll_type_new.on_poll_finalized(winning_proposal=winning_proposal)
-
-
-def poll_kpi_prediction_history(winning_proposal_kpi: PollProposalKPI):
-    return {
-        "winner": winning_proposal_kpi,
-        "bets": PollProposalKPIBet.objects.filter(
-            proposal_kpi__proposal=winning_proposal_kpi.proposal,
-            proposal_kpi__kpi_value__kpi=winning_proposal_kpi.kpi_value.kpi,
-        ).select_related(
-            "created_by",
-            "proposal_kpi",
-            "proposal_kpi__kpi_value",
-            "proposal_kpi__kpi_value__kpi",
-        ),
-    }
-
-
-def quadratic_programming_solver(covariance_matrix, test=False):
-    import cvxpy as cp
-
-    # The covariance matrix shape
-    n = covariance_matrix.shape[0]
-    # No negative probabilities
-    G = -np.identity(n)
-    h = np.zeros(n)
-    # All probabilities add to one
-    q = np.ones(n)
-
-    # Define and solve the CVXPY problem.
-    x = cp.Variable(n)
-    prob = cp.Problem(
-        # @ is matmul
-        # .T is transpose
-        # With method 1, the covariance matricies that can be inputed are always convex
-        cp.Minimize(cp.quad_form(x, covariance_matrix)),
-        [G @ x <= h, q.T @ x == 1],
-    )
-
-    # Convex case
-    try:
-        prob.solve()
-
-    # Concave case
-    except Exception:
-        print("Concave minimization")
-        # TODO: for Emil: extend the algorithm to include the concave minimization case
-
-    solution = x.value
-    optimal_value = prob.value
-    dual_solution = prob.constraints[0].dual_value
-
-    if test:
-        print("\nThe optimal value is", optimal_value)
-        print("A solution x is")
-        print(solution)
-
-    # solution is a vector (np.array) that sums up to 1.
-    return [solution, optimal_value, dual_solution]
-
-
-def newer_kpi_betting(winning_proposal_kpi: PollProposalKPI):
-    """
-    This code was primarily written by Loke Hagberg 2026-06-12
-    This work was made possible by my wonderful best friend: Emil Svenberg
-
-    Track record handling 1 (might be a second track record handling or more later)
-
-    When calculating the combined probability, pick the largest set of participating predictors with longest (within some max number)
-    and fully overlapping track records are there multiple, pick one uniformly randomly.
-
-    Example: If 1 predictor has participated 3 times on winning polls, and 5 predictors has participated 2 times, then this calculation
-    takes the 1 predictor only as input.
-
-    It is valuable to know what the value of the determinant is, one can use numpy.linalg.det(matrix) for that purpose
-    Save all determinants as how near one is to a singular matrix the more sensitive the method chosen is to input data
-
-    Methods for calculating the combined probability
-
-    The DCP rules in cvxpy require that the problem objective have one of two forms: Minimize(convex) or Maximize(concave)
-
-    Long term TODO: Formal verification in an functional language (Haskell? F#? Scala?).
-    Also a compiled program/binary with this can avoid numpy and cvxpy bloat in the rest of flowback without a microservice.
-    """
-    # The covariance matrix
-
-    def method_1(input_matrix):
-        # Might be always convex
-        P_1 = np.cov(input_matrix)
-        result_1 = quadratic_programming_solver(P_1)[0]
-
-    return poll_kpi_prediction_history(
-        winning_proposal_kpi=winning_proposal_kpi
-    )

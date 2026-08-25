@@ -29,6 +29,10 @@ class GroupKPITest(APITestCase):
 
         self.assertEqual(response.status_code, 201, response.data)
         self.assertEqual(GroupKPI.objects.all().count(), 1)
+        self.assertEqual(
+            list(GroupKPIValue.objects.filter(kpi_id=response.data).values_list("value", flat=True)),
+            data["values"].split(","),
+        )
 
     def test_group_kpi_create_one_letter(self):
         data = dict(name="test", description="test", values="d")
@@ -99,4 +103,3 @@ class GroupKPITest(APITestCase):
         self.assertEqual(response.status_code, 400, response.data)
         kpi.refresh_from_db()
         self.assertTrue(kpi.active)
-

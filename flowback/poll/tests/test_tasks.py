@@ -44,3 +44,28 @@ class TestQuadraticProgrammingSolver(TestCase):
             ),
             expected_optimal_value=3.514995119900657e-50,
         )
+
+    def test_indefinite_covariance_matrix_still_returns_a_solution(self):
+        # eigenvalues [-1, 1]: genuinely concave, not float noise around PSD.
+        # Entries stay within the valid [0, 1] range. Solver silently
+        # swallows this (prints "Concave minimization") and returns None
+        # instead of solving or raising. RED until the concave branch
+        # (tasks.py:840-843) actually does something.
+        solution, optimal_value, _ = quadratic_programming_solver(
+            np.array([[0.0, 1.0], [1.0, 0.0]])
+        )
+        self.assertIsNotNone(solution)
+        self.assertIsNotNone(optimal_value)
+
+    def test_covariance_matrix_entry_above_one_is_rejected(self):
+        with self.assertRaises(ValueError):
+            quadratic_programming_solver(np.array([[1.0, 2.0], [2.0, 1.0]]))
+
+    def test_nan_covariance_matrix_does_not_raise(self):
+        # NaN entries (e.g. from a predictor's missing bets leaking into
+        # np.cov) blow up before the try/except even starts, since
+        # cp.quad_form's symmetry check fails on nan != nan. RED: raises
+        # ValueError uncaught instead of being handled.
+        quadratic_programming_solver(
+            np.array([[1.0, np.nan], [np.nan, 1.0]])
+        )

@@ -265,6 +265,9 @@ def poll_proposal_kpi_bet(user_id: int,
     if not len(values) == len(weights):
         raise ValidationError("Values have more or less values than weights.")
 
+    if sum(weights) > 100:
+        raise ValidationError("Total weight cannot exceed 100.")
+
     if any([i not in kpi.values for i in values]):
         raise ValidationError("One or more KPI values does not exist in the KPI")
 
@@ -324,7 +327,7 @@ def poll_proposal_kpi_vote(user_id: int,
 
 
 def longest_poll_prediction_kpi_group_users(group: Group,
-                                            users: list[User] | QuerySet[User]) -> QuerySet[GroupUser] | None:
+                                            users_filter: list[User] | QuerySet[User]) -> QuerySet[GroupUser] | None:
     """
     Returns user(s) with most prediction bets cast (KPI V2_Score polls only)
     :param group: The group users are within
@@ -336,13 +339,22 @@ def longest_poll_prediction_kpi_group_users(group: Group,
 
     # List of eligible KPIs
     prediction_count = Count('pollproposalkpibet',
-                             filter=Q(pollproposalkpibet__proposal_kpi__proposal__poll__end_date__lte=timestamp,
-                                      pollproposalkpibet__proposal_kpi__proposal__poll__poll_type=Poll.PollType.V2_SCORE,
-                                      pollproposalkpibet__proposal_kpi__kpi_value__kpi__active=True))
+                            filter=Q(pollproposalkpibet__proposal_kpi__proposal__poll__end_date__lte=timestamp,
+                                    pollproposalkpibet__proposal_kpi__proposal__poll__poll_type=Poll.PollType.V2_SCORE,
+                                    pollproposalkpibet__proposal_kpi__kpi_value__kpi__active=True))
 
-    longest_prediction_history_group_user = GroupUser.objects.filter(
-        group=group, user__in=users
-    ).annotate(prediction_count=prediction_count)
+    longest_prediction_history_group_user = GroupUser.objects.filter(group=group)
+
+    if users_filter is not None:
+        longest_prediction_history_group_user = (
+            longest_prediction_history_group_user.filter(user__in=users_filter)
+        )
+
+    longest_prediction_history_group_user = (
+        longest_prediction_history_group_user.annotate(
+            prediction_count=prediction_count,
+        )
+    )
 
     result = longest_prediction_history_group_user.order_by('-prediction_count')
 
@@ -362,9 +374,10 @@ def longest_poll_prediction_group_user(group: Group,
 
     # List of eligible KPIs
     prediction_count = Count('pollpredictionbet',
-                             filter=Q(pollpredictionbet__prediction_statement__poll__end_date__lte=timestamp,
-                                      pollpredictionbet__prediction_statement__poll__poll_type=Poll.PollType.SCORE,
-                                      pollpredictionbet__prediction_statement__poll__active=True))
+                            filter=Q(pollpredictionbet__prediction_statement__poll__end_date__lte=timestamp,
+                                    pollpredictionbet__prediction_statement__poll__poll_type=Poll.PollType.SCORE,
+                                    pollproposalkpibet__proposal_kpi__pollproposalkpivote__isnull=False,
+                                    pollpredictionbet__prediction_statement__poll__active=True))
 
     longest_prediction_history_group_user = GroupUser.objects.filter(
         group=group, user__in=users

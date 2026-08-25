@@ -1,12 +1,16 @@
+import numpy as np
 from rest_framework.test import APITestCase
 from django.test import override_settings
 
 from flowback.common.tests import generate_request
-from flowback.group.models import GroupKPI, GroupUser, Group, GroupKPIValue
+from flowback.group.models import GroupKPI, GroupUser, Group
 from flowback.group.tests.factories import GroupFactory, GroupUserFactory, GroupKPIFactory, GroupKPIValueFactory
 from flowback.poll.models import Poll
 from flowback.poll.phases import PollProposal, PollProposalKPI, PollProposalKPIBet, PollProposalKPIVote
 from flowback.poll.tasks import poll_kpi_count
+from flowback.poll.tasks_new_kpi import (
+    bet_outcome_matrix,
+)
 from flowback.poll.tests.factories import PollFactory, PollProposalFactory, PollProposalKPIBetFactory, \
     PollProposalKPIVoteFactory
 from flowback.poll.tests.utils import generate_poll_phase_kwargs
@@ -48,7 +52,7 @@ class TestPollProposalKPI(APITestCase):
 
     def test_kpi_bet(self):
         values = [12, 22, 29]
-        weights = [19, 705, 2]
+        weights = [19, 79, 2]
 
         response = generate_request(api=PollProposalKPIBetAPI,
                                     user=self.group_user_one.user,
@@ -64,6 +68,17 @@ class TestPollProposalKPI(APITestCase):
                                                               proposal_kpi__kpi_value__value=values[i],
                                                               weight=weights[i]).exists(),
                             f"KPI bet with value {values[i]} and weight {weights[i]} does not exist!")
+
+    def test_kpi_bet_rejects_over_100_percent(self):
+        response = generate_request(api=PollProposalKPIBetAPI,
+                                    user=self.group_user_one.user,
+                                    url_params=dict(proposal_id=self.proposal_one.id),
+                                    data=dict(kpi_id=self.group_kpi_one.id,
+                                              values=[12, 22, 29],
+                                              weights=[50, 40, 11]))
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertFalse(PollProposalKPIBet.objects.filter(created_by=self.group_user_one).exists())
 
     def test_kpi_vote(self):
         bets = [(self.group_kpi_one, 12), (self.group_kpi_one, 22), (self.group_kpi_two, 99)]
@@ -112,6 +127,70 @@ class TestPollProposalKPI(APITestCase):
                                           proposal_kpi=PollProposalKPI.objects.get(proposal=proposal,
                                                                                    kpi_value__kpi=group_kpi,
                                                                                    kpi_value__value=value))
+
+    def test_bet_outcome_matrix_matches_comment_example(self):
+        proposals = []
+        winners = []
+
+        for _ in range(2):
+            poll = self.generate_kpi_poll(group=self.group)
+            proposal = PollProposalFactory(poll=poll, created_by=self.group_user_creator)
+            PollProposalKPI.generate_kpis(proposal_id=proposal.id)
+            proposal_kpis = list(
+                PollProposalKPI.objects.filter(
+                    proposal=proposal,
+                    kpi_value__kpi=self.group_kpi_one,
+                ).order_by("id")
+            )
+
+            self.generate_kpi_bet(
+                self.group_user_one, self.group_kpi_one, proposal, 29, 100
+            )
+            for proposal_kpi, weight in zip(proposal_kpis, [33, 33, 34]):
+                PollProposalKPIBetFactory(
+                    created_by=self.group_user_two,
+                    proposal_kpi=proposal_kpi,
+                    weight=weight,
+                )
+
+            proposals.append(proposal)
+            winners.append(proposal_kpis[2])
+
+        matrix = bet_outcome_matrix(
+            PollProposalKPIBet.objects.filter(proposal_kpi__proposal__in=proposals),
+            PollProposalKPI.objects.filter(id__in=[winner.id for winner in winners]),
+        )
+
+        np.testing.assert_allclose(
+            matrix,
+            [
+                [0, 0, 0, 0, 0, 0],
+                [0.33, 0.33, -0.66, 0.33, 0.33, -0.66],
+            ],
+        )
+
+    def test_update_kpi_combined_bets(self):
+        poll = self.generate_kpi_poll(group=self.group)
+        proposal = PollProposalFactory(
+            poll=poll, created_by=self.group_user_creator
+        )
+        PollProposalKPI.generate_kpis(proposal_id=proposal.id)
+        self.generate_kpi_vote(
+            self.group_user_one, self.group_kpi_one, proposal, 12
+        )
+        self.generate_kpi_vote(
+            self.group_user_two, self.group_kpi_one, proposal, 22
+        )
+
+        combined_bets = dict(
+            PollProposalKPI.objects.filter(
+                proposal=proposal, kpi_value__kpi=self.group_kpi_one
+            ).values_list("kpi_value__value", "combined_bet")
+        )
+        self.assertEqual(float(combined_bets["12"]), 0.25)
+        self.assertEqual(float(combined_bets["22"]), 0.75)
+        self.assertEqual(float(combined_bets["29"]), 0)
+        self.assertEqual(sum(map(float, combined_bets.values())), 1)
 
     def test_kpi_combined_bet(self):
         # group_kpi_one, [12, 22, 29]
@@ -189,7 +268,7 @@ class TestPollProposalKPI(APITestCase):
         print("\n\n")
 
     @override_settings(FLOWBACK_ENABLE_NEW_KPI_SYSTEM=True)
-    def test_new_kpi_betting_queries_bets_for_each_winner(self):
+    def test_new_kpi_betting_returns_weighted_vote_average(self):
         poll = PollFactory(created_by=self.group_user_creator,
                            poll_type=Poll.PollType.V2_SCORE,
                            **generate_poll_phase_kwargs('prediction_vote'))
@@ -223,46 +302,33 @@ class TestPollProposalKPI(APITestCase):
             self.group_user_two, self.group_kpi_one, proposal, 12
         )
 
-        histories = poll_kpi_count(poll_id=poll.id)
-        history = histories[0]
-        winner = history["winner"]
-        bets = list(history["bets"])
-        winner_votes = PollProposalKPIVote.objects.filter(
-            proposal_kpi=winner
-        ).count()
-        logged_bets = [
-            {
-                "group_user_id": bet.created_by_id,
-                "value": bet.proposal_kpi.kpi_value.value,
-                "weight": bet.weight,
-            }
-            for bet in bets
-        ]
-
-        print(
-            "Winning KPI:",
-            {
-                "kpi": winner.kpi_value.kpi.name,
-                "value": winner.kpi_value.value,
-                "votes": winner_votes,
-            },
+        self.assertEqual(
+            poll_kpi_count(poll_id=poll.id),
+            [
+                {
+                    "proposal_id": proposal.id,
+                    "kpi_id": self.group_kpi_one.id,
+                    "value": "22",
+                    "weighted_average": 1.0,
+                }
+            ],
         )
-        print("Bets for winner's proposal/KPI:", logged_bets)
-
-        self.assertEqual(len(histories), 1)
-        self.assertEqual(winner.kpi_value.value, "22")
-        self.assertEqual(winner_votes, 2)
-        self.assertSetEqual(
-            {
-                (bet.proposal_kpi.kpi_value.value, bet.weight)
-                for bet in bets
-            },
-            {("12", 5), ("22", 10)},
+        combined_bets = dict(
+            PollProposalKPI.objects.filter(
+                proposal=proposal, kpi_value__kpi=self.group_kpi_one
+            ).values_list("kpi_value__value", "combined_bet")
         )
+        self.assertEqual(float(combined_bets["12"]), 0)
+        self.assertEqual(float(combined_bets["22"]), 1)
+        self.assertEqual(float(combined_bets["29"]), 0)
 
-    @override_settings(FLOWBACK_ENABLE_NEW_KPI_SYSTEM=False)
-    def test_old_kpi_betting_runs_when_new_system_is_disabled(self):
-        self.assertIsNone(poll_kpi_count(poll_id=self.poll.id))
+    def test_new_kpi_betting_returns_no_averages_without_history(self):
+        self.assertEqual(poll_kpi_count(poll_id=self.poll.id), [])
+        self.assertFalse(
+            PollProposalKPI.objects.filter(
+                proposal__poll=self.poll, combined_bet__isnull=False
+            ).exists()
+        )
 
     def test_proposal_kpi_list(self):
         # TODO block users from accessing kpis they are not permitted to access (e.g. poll for specific workgroup)

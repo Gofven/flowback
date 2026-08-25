@@ -8,7 +8,7 @@ VERSION = "1.0.0"
 
 env = environ.Env(DEBUG=(bool, True),
                   DEBUG_REGISTER_BYPASS_EMAIL_VERIFICATION=(bool, False),
-                  LOGGING=(str, 'NONE'),
+                  LOGGING=(str, 'INFO'),
                   SECURE_PROXY_SSL_HEADERS=(bool, False),
                   DJANGO_SECRET=str,
                   FLOWBACK_URL=(str, None),
@@ -366,6 +366,10 @@ if env('LOGGING') in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
                 "filename": "general.log",
             },
         },
+        "root": {
+            "handlers": ["file"],
+            "level": env('LOGGING'),
+        },
         "loggers": {
             "django": {
                 "handlers": ["file"],
@@ -377,6 +381,8 @@ if env('LOGGING') in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
 
     if DEBUG:
         LOGGING['handlers']['console'] = {'class': 'logging.StreamHandler'}
+        LOGGING['root']['handlers'].append('console')
+        LOGGING['loggers']['django']['handlers'].append('console')
 
 # Internationalization
 # https://docs.djangoproject.com/en/4.0/topics/i18n/

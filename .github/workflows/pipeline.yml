@@ -157,5 +157,5 @@ jobs:
           key: ${{ secrets.KEY }}
           port: 22
           script: |
-            cd flowback/flowback-docker
+            cd flowback/flowback-docker-prod
             docker compose pull && docker compose up -d

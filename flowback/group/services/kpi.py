@@ -7,9 +7,6 @@ from ..models import GroupKPI, GroupKPIValue
 def group_kpi_create(user_id: int, group_id: int, name: str, values: list[str], description: str = None):
     group_user_permissions(user=user_id, group=group_id, permissions=['admin'])
 
-    if 'Other' in values or 'other' in values:
-        raise ValidationError('"Other" is a reserved KPI value and cannot be provided manually')
-
     if len(values) != len(set(values)):
         raise ValidationError("Duplicates in values are not permitted")
 
@@ -18,7 +15,6 @@ def group_kpi_create(user_id: int, group_id: int, name: str, values: list[str], 
     kpi.save()
 
     kpi_values = [GroupKPIValue(kpi=kpi, value=i) for i in values]
-    kpi_values.append(GroupKPIValue(kpi=kpi, value='Other'))
     GroupKPIValue.objects.bulk_create(kpi_values)
 
     return kpi
